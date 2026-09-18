@@ -3773,7 +3773,7 @@ dependencies = [
  "async-stream",
  "axum",
  "axum-server",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bollard",
  "bytes",
  "cel",
@@ -3837,7 +3837,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "cel",
  "chrono",
  "etcd-client",
@@ -3875,7 +3875,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "clap",
  "cron",
@@ -3918,7 +3918,7 @@ name = "rusternetes-kubectl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "clap",

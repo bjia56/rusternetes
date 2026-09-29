@@ -23,6 +23,16 @@ where
     }
 }
 
+/// Serialize an Option<String> as an empty string when unset.
+/// `image` and `imageID` are required fields of a Kubernetes ContainerStatus, and typed
+/// clients reject a status that omits them.
+fn serialize_string_or_empty<S>(value: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(value.as_deref().unwrap_or(""))
+}
+
 /// Macro to create a skip_serializing_if function for Option<T> where T has all optional fields.
 /// This prevents serializing empty structs as {} when all fields are None.
 macro_rules! skip_if_empty {
@@ -1294,10 +1304,14 @@ pub struct ContainerStatus {
     )]
     pub last_state: Option<ContainerState>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, serialize_with = "serialize_string_or_empty")]
     pub image: Option<String>,
 
-    #[serde(rename = "imageID", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "imageID",
+        default,
+        serialize_with = "serialize_string_or_empty"
+    )]
     pub image_id: Option<String>,
 
     #[serde(rename = "containerID", skip_serializing_if = "Option::is_none")]
@@ -1734,6 +1748,45 @@ pub struct PodResourceClaimStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn waiting_container_status() -> ContainerStatus {
+        serde_json::from_value(serde_json::json!({
+            "name": "c",
+            "ready": false,
+            "restartCount": 0,
+            "state": {"waiting": {"reason": "ContainerCreating"}},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_container_status_serializes_unset_image_id_as_empty() {
+        let status = waiting_container_status();
+        assert_eq!(status.image_id, None);
+
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["imageID"], "");
+        assert_eq!(json["image"], "");
+    }
+
+    #[test]
+    fn test_container_status_serializes_set_image_id() {
+        let mut status = waiting_container_status();
+        status.image = Some("busybox".to_string());
+        status.image_id = Some("docker-pullable://sha256:abc".to_string());
+
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["image"], "busybox");
+        assert_eq!(json["imageID"], "docker-pullable://sha256:abc");
+    }
+
+    #[test]
+    fn test_container_status_empty_image_id_roundtrips() {
+        let status = waiting_container_status();
+        let json = serde_json::to_string(&status).unwrap();
+        let back: ContainerStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.image_id.as_deref(), Some(""));
+    }
 
     #[test]
     fn test_pod_with_pvc_volume_serialization() {

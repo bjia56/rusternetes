@@ -2588,8 +2588,10 @@ impl Kubelet {
                 // K8s computePodActions: check if any spec containers are MISSING from the
                 // runtime and need to be (re)created. This happens when a container was never
                 // started (e.g., after a StatefulSet PATCH recreates the pod) or was removed.
+                // Regular containers only start once every init container has completed.
+                let init_containers_done = self.runtime.compute_init_container_actions(pod).await.0;
                 if let Some(ref spec) = pod.spec {
-                    for container in &spec.containers {
+                    for container in spec.containers.iter().filter(|_| init_containers_done) {
                         let container_name = format!("{}_{}", pod_name, container.name);
                         if !self.runtime.container_exists(&container_name).await {
                             info!(

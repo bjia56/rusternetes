@@ -30,7 +30,21 @@ impl Namespace {
             }),
         }
     }
+
+    /// Set the `kubernetes.io/metadata.name` label to the namespace name, as the API server
+    /// does for every namespace. Returns true if the labels changed.
+    pub fn ensure_name_label(&mut self) -> bool {
+        let labels = self.metadata.labels.get_or_insert_with(Default::default);
+        if labels.get(NAME_LABEL) == Some(&self.metadata.name) {
+            return false;
+        }
+        labels.insert(NAME_LABEL.to_string(), self.metadata.name.clone());
+        true
+    }
 }
+
+/// Label the API server sets on every namespace to its own name
+pub const NAME_LABEL: &str = "kubernetes.io/metadata.name";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -76,4 +90,39 @@ pub struct NamespaceCondition {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ensure_name_label_adds_label() {
+        let mut ns = Namespace::new("kube-system");
+        assert!(ns.ensure_name_label());
+        assert_eq!(
+            ns.metadata.labels.as_ref().unwrap().get(NAME_LABEL),
+            Some(&"kube-system".to_string())
+        );
+    }
+
+    #[test]
+    fn test_ensure_name_label_is_idempotent() {
+        let mut ns = Namespace::new("default");
+        assert!(ns.ensure_name_label());
+        assert!(!ns.ensure_name_label());
+    }
+
+    #[test]
+    fn test_ensure_name_label_overrides_wrong_value_and_keeps_other_labels() {
+        let mut ns = Namespace::new("team-a");
+        let labels = ns.metadata.labels.get_or_insert_with(Default::default);
+        labels.insert(NAME_LABEL.to_string(), "other".to_string());
+        labels.insert("env".to_string(), "dev".to_string());
+
+        assert!(ns.ensure_name_label());
+        let labels = ns.metadata.labels.as_ref().unwrap();
+        assert_eq!(labels.get(NAME_LABEL), Some(&"team-a".to_string()));
+        assert_eq!(labels.get("env"), Some(&"dev".to_string()));
+    }
 }

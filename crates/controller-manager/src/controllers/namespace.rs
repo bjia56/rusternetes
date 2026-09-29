@@ -157,6 +157,20 @@ impl<S: Storage + 'static> NamespaceController<S> {
             return self.finalize_namespace(namespace).await;
         }
 
+        // Namespaces created before the API server set the name label, or by a patch that
+        // removed it, get it here.
+        let mut labeled = namespace.clone();
+        if labeled.ensure_name_label() {
+            let ns_key = build_key("namespaces", None, name);
+            match self.storage.update(&ns_key, &labeled).await {
+                Ok(_) => info!(
+                    "Set kubernetes.io/metadata.name label on namespace {}",
+                    name
+                ),
+                Err(e) => warn!("Failed to label namespace {}: {}", name, e),
+            }
+        }
+
         // Ensure kube-root-ca.crt ConfigMap exists with correct CA data.
         // K8s rootcacertpublisher checks if the data matches and updates if not.
         // See: pkg/controller/certificates/rootcacertpublisher/publisher.go:syncNamespace()
@@ -901,6 +915,28 @@ mod tests {
             "ContentFailure should be False when no finalizers"
         );
         assert_eq!(content_failure.reason.as_deref(), Some("ContentDeleted"));
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_namespace_backfills_name_label() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = NamespaceController::new(storage.clone());
+
+        let ns = Namespace::new("kube-system");
+        let key = build_key("namespaces", None, "kube-system");
+        storage.create(&key, &ns).await.unwrap();
+
+        controller.reconcile_namespace(&ns).await.unwrap();
+
+        let stored: Namespace = storage.get(&key).await.unwrap();
+        assert_eq!(
+            stored
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("kubernetes.io/metadata.name")),
+            Some(&"kube-system".to_string())
+        );
     }
 
     #[tokio::test]

@@ -80,11 +80,63 @@ fn detect_bridge_network() -> Option<(String, String)> {
     None
 }
 
+/// Whether the kernel passes bridged traffic through iptables.
+fn bridge_nf_call_iptables_enabled() -> bool {
+    std::fs::read_to_string("/proc/sys/net/bridge/bridge-nf-call-iptables")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Arguments (after `-A <chain>`) of the hairpin masquerade rule for one endpoint: matches
+/// only a pod that reaches itself through a service.
+fn hairpin_rule_args(endpoint_ip: &str, endpoint_port: u16, proto: &str) -> Vec<String> {
+    [
+        "-s",
+        endpoint_ip,
+        "-d",
+        endpoint_ip,
+        "-p",
+        proto,
+        "--dport",
+        &endpoint_port.to_string(),
+        "-j",
+        "MASQUERADE",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Match arguments of the rule masquerading DNAT'd service traffic. With a known pod
+/// CIDR, traffic that starts in it keeps its source IP.
+fn dnat_masquerade_match_args(pod_cidr: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "-m".to_string(),
+        "comment".to_string(),
+        "--comment".to_string(),
+        "rusternetes DNAT traffic masquerade".to_string(),
+    ];
+    if let Some(cidr) = pod_cidr {
+        args.extend(["!".to_string(), "-s".to_string(), cidr.to_string()]);
+    }
+    args.extend(
+        ["-m", "conntrack", "--ctstate", "DNAT", "-j", "MASQUERADE"]
+            .iter()
+            .map(|s| s.to_string()),
+    );
+    args
+}
+
 /// IptablesManager handles iptables rule programming for service networking
 pub struct IptablesManager {
     /// Chain names we create
     services_chain: String,
     nodeports_chain: String,
+    /// NAT POSTROUTING chain holding one hairpin masquerade rule per endpoint
+    hairpin_chain: String,
+    /// Set by `initialize` when bridged traffic traverses iptables (br_netfilter), so
+    /// same-bridge replies are un-DNAT'd without masquerading and pod source IPs survive
+    preserve_pod_source: std::sync::atomic::AtomicBool,
     /// The iptables command to use (detected at init)
     iptables_cmd: String,
     /// Track per-endpoint chains (KUBE-SEP-*) so we can clean them up on flush
@@ -113,6 +165,8 @@ impl IptablesManager {
         Self {
             services_chain: "RUSTERNETES-SERVICES".to_string(),
             nodeports_chain: "RUSTERNETES-NODEPORTS".to_string(),
+            hairpin_chain: "RUSTERNETES-HAIRPIN".to_string(),
+            preserve_pod_source: std::sync::atomic::AtomicBool::new(false),
             iptables_cmd: "/usr/sbin/iptables".to_string(),
             sep_chains: std::sync::Mutex::new(Vec::new()),
             recent_available,
@@ -162,6 +216,8 @@ impl IptablesManager {
         Self {
             services_chain: "RUSTERNETES-SERVICES".to_string(),
             nodeports_chain: "RUSTERNETES-NODEPORTS".to_string(),
+            hairpin_chain: "RUSTERNETES-HAIRPIN".to_string(),
+            preserve_pod_source: std::sync::atomic::AtomicBool::new(false),
             iptables_cmd,
             sep_chains: std::sync::Mutex::new(Vec::new()),
             recent_available,
@@ -203,9 +259,21 @@ impl IptablesManager {
             }
         }
 
+        let preserve_pod_source = bridge_nf_call_iptables_enabled();
+        self.preserve_pod_source
+            .store(preserve_pod_source, std::sync::atomic::Ordering::Relaxed);
+        if preserve_pod_source {
+            info!("bridge-nf-call-iptables is enabled, preserving pod source IPs for services");
+        } else {
+            warn!(
+                "bridge-nf-call-iptables is not enabled, masquerading service traffic between pods"
+            );
+        }
+
         // Create our custom chains if they don't exist
         self.ensure_chain("nat", &self.services_chain)?;
         self.ensure_chain("nat", &self.nodeports_chain)?;
+        self.ensure_chain("nat", &self.hairpin_chain)?;
 
         // Add jump rules from PREROUTING and OUTPUT to our chains
         self.ensure_jump_rule(
@@ -241,7 +309,17 @@ impl IptablesManager {
         // Without this, DNATed traffic within the Docker bridge doesn't have its source
         // rewritten, so the return path bypasses NAT and the connection fails.
         // Use the dynamically detected bridge CIDR (works with both Docker and Podman).
-        if let Some(ref cidr) = self.bridge_cidr {
+        if preserve_pod_source {
+            // With br_netfilter, same-bridge replies are un-DNAT'd without masquerade, so
+            // only a pod reaching itself through a service needs its source rewritten.
+            // Those per-endpoint rules live in the hairpin chain.
+            self.ensure_jump_rule(
+                "nat",
+                "POSTROUTING",
+                &self.hairpin_chain,
+                "rusternetes service hairpin",
+            )?;
+        } else if let Some(ref cidr) = self.bridge_cidr {
             let masq_check = Command::new(&self.iptables_cmd)
                 .args([
                     "-t",
@@ -352,42 +430,22 @@ impl IptablesManager {
         // This covers both ClusterIP and NodePort: when traffic is DNATed to a pod
         // the source must be rewritten so the reply comes back through the node for
         // proper connection tracking.
+        // When bridged traffic traverses iptables, traffic that starts inside the pod
+        // network keeps its source IP; only other sources are masqueraded.
+        let pod_cidr = if preserve_pod_source {
+            self.bridge_cidr.as_deref()
+        } else {
+            None
+        };
+        let dnat_masq_args = dnat_masquerade_match_args(pod_cidr);
         let dnat_masq_check = Command::new(&self.iptables_cmd)
-            .args([
-                "-t",
-                "nat",
-                "-C",
-                "POSTROUTING",
-                "-m",
-                "comment",
-                "--comment",
-                "rusternetes DNAT traffic masquerade",
-                "-m",
-                "conntrack",
-                "--ctstate",
-                "DNAT",
-                "-j",
-                "MASQUERADE",
-            ])
+            .args(["-t", "nat", "-C", "POSTROUTING"])
+            .args(&dnat_masq_args)
             .output();
         if dnat_masq_check.map_or(true, |o| !o.status.success()) {
             let output = Command::new(&self.iptables_cmd)
-                .args([
-                    "-t",
-                    "nat",
-                    "-A",
-                    "POSTROUTING",
-                    "-m",
-                    "comment",
-                    "--comment",
-                    "rusternetes DNAT traffic masquerade",
-                    "-m",
-                    "conntrack",
-                    "--ctstate",
-                    "DNAT",
-                    "-j",
-                    "MASQUERADE",
-                ])
+                .args(["-t", "nat", "-A", "POSTROUTING"])
+                .args(&dnat_masq_args)
                 .output()
                 .context("Failed to add DNAT MASQUERADE rule")?;
             if output.status.success() {
@@ -783,6 +841,7 @@ impl IptablesManager {
 
         self.flush_chain("nat", &self.services_chain)?;
         self.flush_chain("nat", &self.nodeports_chain)?;
+        self.flush_chain("nat", &self.hairpin_chain)?;
 
         // Clean up all per-endpoint (SEP) chains from previous sync.
         // These must be flushed and deleted, otherwise on resync:
@@ -883,6 +942,27 @@ impl IptablesManager {
         guard.push(chain.to_string());
     }
 
+    /// Masquerade a pod that reaches itself through a service, one rule per endpoint.
+    /// Only used when pod source IPs are preserved; otherwise the bridge-wide masquerade
+    /// rules cover this case.
+    fn add_hairpin_rules(&self, endpoints: &[(String, u16)], proto: &str) {
+        if !self
+            .preserve_pod_source
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        for (endpoint_ip, endpoint_port) in endpoints {
+            let rule = hairpin_rule_args(endpoint_ip, *endpoint_port, proto);
+            let mut args = vec!["-t", "nat", "-A", self.hairpin_chain.as_str()];
+            args.extend(rule.iter().map(String::as_str));
+            self.run_iptables_logged(
+                &args,
+                &format!("hairpin masquerade for {}:{}", endpoint_ip, endpoint_port),
+            );
+        }
+    }
+
     /// Add rules for a ClusterIP service.
     ///
     /// Session affinity implementation:
@@ -925,6 +1005,7 @@ impl IptablesManager {
 
         let proto = protocol.to_lowercase();
         let n = endpoints.len();
+        self.add_hairpin_rules(endpoints, &proto);
 
         if session_affinity && self.recent_available {
             // Session affinity with xt_recent module available.
@@ -1126,6 +1207,7 @@ impl IptablesManager {
 
         let proto = protocol.to_lowercase();
         let n = endpoints.len();
+        self.add_hairpin_rules(endpoints, &proto);
 
         if session_affinity && self.recent_available {
             // Session affinity for NodePort with xt_recent module.
@@ -1304,10 +1386,12 @@ impl IptablesManager {
         self.remove_jump_rule("nat", "OUTPUT", &self.services_chain)?;
         self.remove_jump_rule("nat", "PREROUTING", &self.nodeports_chain)?;
         self.remove_jump_rule("nat", "OUTPUT", &self.nodeports_chain)?;
+        self.remove_jump_rule("nat", "POSTROUTING", &self.hairpin_chain)?;
 
         // Delete our chains
         self.delete_chain("nat", &self.services_chain)?;
         self.delete_chain("nat", &self.nodeports_chain)?;
+        self.delete_chain("nat", &self.hairpin_chain)?;
 
         info!("Kube-proxy iptables cleanup complete");
         Ok(())
@@ -1741,6 +1825,42 @@ impl Drop for IptablesManager {
 
 #[cfg(test)]
 mod tests {
+    use super::{dnat_masquerade_match_args, hairpin_rule_args};
+
+    #[test]
+    fn test_hairpin_rule_matches_only_self_traffic() {
+        let args = hairpin_rule_args("10.89.0.4", 9444, "tcp");
+        assert_eq!(
+            args,
+            [
+                "-s",
+                "10.89.0.4",
+                "-d",
+                "10.89.0.4",
+                "-p",
+                "tcp",
+                "--dport",
+                "9444",
+                "-j",
+                "MASQUERADE"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_dnat_masquerade_excludes_pod_cidr_sources() {
+        let args = dnat_masquerade_match_args(Some("10.89.0.0/24"));
+        let joined = args.join(" ");
+        assert!(joined.contains("! -s 10.89.0.0/24"), "{}", joined);
+        assert!(joined.ends_with("-m conntrack --ctstate DNAT -j MASQUERADE"));
+    }
+
+    #[test]
+    fn test_dnat_masquerade_without_pod_cidr_matches_all_sources() {
+        let joined = dnat_masquerade_match_args(None).join(" ");
+        assert!(!joined.contains("-s "), "{}", joined);
+        assert!(joined.ends_with("-m conntrack --ctstate DNAT -j MASQUERADE"));
+    }
 
     #[test]
     fn test_probability_calculation_uniform() {

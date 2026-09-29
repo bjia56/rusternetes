@@ -42,6 +42,7 @@ pub async fn create(
     // Enrich metadata with system fields
     namespace.metadata.ensure_uid();
     namespace.metadata.ensure_creation_timestamp();
+    namespace.ensure_name_label();
 
     // Ensure namespace has Active status (always set phase even if status exists but phase is None)
     match &mut namespace.status {
@@ -293,6 +294,7 @@ pub async fn update(
     }
 
     namespace.metadata.name = name.clone();
+    namespace.ensure_name_label();
 
     let key = build_key("namespaces", None, &name);
 

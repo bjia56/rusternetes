@@ -57,7 +57,6 @@ pub struct LogsQuery {
     pub container: Option<String>,
     /// Follow the log stream
     #[serde(default)]
-    #[allow(dead_code)]
     pub follow: bool,
     /// Return previous terminated container logs
     #[serde(default)]
@@ -190,6 +189,24 @@ pub async fn get_logs(
         )));
     }
 
+    // Follow: stream the runtime's log output instead of buffering it
+    if query.follow && ws.is_none() {
+        match prepare_container_logs(&pod, &container_name, &query, true).await {
+            Ok((docker, container, options)) => {
+                return Ok(stream_container_logs(
+                    docker,
+                    container,
+                    options,
+                    query.limit_bytes.map(|l| l as usize),
+                ));
+            }
+            Err(e) => info!(
+                "Failed to follow real container logs, using fallback: {}",
+                e
+            ),
+        }
+    }
+
     // Get logs from the container runtime
     let logs = match get_container_logs(&pod, &container_name, &query).await {
         Ok(logs) => logs,
@@ -221,15 +238,19 @@ pub async fn get_logs(
     }
 }
 
-/// Get real logs from the container runtime
-async fn get_container_logs(
+/// Resolve the runtime container for a pod container and build its log options
+async fn prepare_container_logs(
     pod: &rusternetes_common::resources::Pod,
     container_name: &str,
     query: &LogsQuery,
-) -> anyhow::Result<String> {
+    follow: bool,
+) -> anyhow::Result<(
+    bollard::Docker,
+    String,
+    bollard::container::LogsOptions<String>,
+)> {
     use bollard::container::LogsOptions;
     use bollard::Docker;
-    use futures::StreamExt;
 
     // Connect to Docker/Podman
     let docker = Docker::connect_with_local_defaults()
@@ -242,6 +263,7 @@ async fn get_container_logs(
     let mut options = LogsOptions::<String> {
         stdout: true,
         stderr: true,
+        follow,
         timestamps: query.timestamps,
         tail: query
             .tail_lines
@@ -299,6 +321,67 @@ async fn get_container_logs(
         }
     };
 
+    Ok((docker, effective_name, options))
+}
+
+/// Stream logs from the container runtime until the container exits or the client disconnects
+fn stream_container_logs(
+    docker: bollard::Docker,
+    container: String,
+    options: bollard::container::LogsOptions<String>,
+    limit_bytes: Option<usize>,
+) -> Response {
+    use futures::StreamExt;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(16);
+    tokio::spawn(async move {
+        let mut log_stream = docker.logs(&container, Some(options));
+        let mut total_bytes = 0usize;
+        while let Some(log_result) = log_stream.next().await {
+            let mut chunk = match log_result {
+                Ok(chunk) => chunk.into_bytes(),
+                Err(e) => {
+                    let _ = tx.send(Err(std::io::Error::other(e))).await;
+                    break;
+                }
+            };
+            let mut done = false;
+            if let Some(limit) = limit_bytes {
+                let remaining = limit.saturating_sub(total_bytes);
+                if chunk.len() >= remaining {
+                    chunk.truncate(remaining);
+                    done = true;
+                }
+            }
+            total_bytes += chunk.len();
+            if !chunk.is_empty() && tx.send(Ok(chunk)).await.is_err() {
+                break;
+            }
+            if done {
+                break;
+            }
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .body(Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+        .unwrap()
+}
+
+/// Get real logs from the container runtime
+async fn get_container_logs(
+    pod: &rusternetes_common::resources::Pod,
+    container_name: &str,
+    query: &LogsQuery,
+) -> anyhow::Result<String> {
+    use futures::StreamExt;
+
+    let (docker, effective_name, options) =
+        prepare_container_logs(pod, container_name, query, false).await?;
     let mut log_stream = docker.logs(&effective_name, Some(options));
 
     let mut log_output = String::new();
@@ -1350,6 +1433,37 @@ mod tests {
     use rusternetes_common::types::{LabelSelector, ObjectMeta, TypeMeta};
     use rusternetes_storage::memory::MemoryStorage;
     use std::collections::HashMap;
+
+    #[test]
+    fn test_logs_query_parses_follow() {
+        let query: LogsQuery = serde_json::from_value(serde_json::json!({"follow": true})).unwrap();
+        assert!(query.follow);
+
+        let query: LogsQuery = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!query.follow);
+    }
+
+    #[tokio::test]
+    async fn test_stream_container_logs_returns_chunked_body_without_content_length() {
+        // No container runtime is reachable, so the body ends with an error chunk; the
+        // response itself must still be a streaming one.
+        let docker = bollard::Docker::connect_with_http(
+            "http://127.0.0.1:1",
+            1,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .unwrap();
+        let options = bollard::container::LogsOptions::<String> {
+            follow: true,
+            ..Default::default()
+        };
+        let response = stream_container_logs(docker, "missing".to_string(), options, None);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .headers()
+            .get(axum::http::header::CONTENT_LENGTH)
+            .is_none());
+    }
 
     fn make_pod(
         name: &str,

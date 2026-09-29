@@ -75,6 +75,7 @@ impl ProtoRegistry {
         // ========== apimachinery types ==========
 
         schemas.insert("ObjectMeta".into(), Self::object_meta_schema());
+        Self::insert_authorization_schemas(&mut schemas);
         schemas.insert("LabelSelector".into(), Self::label_selector_schema());
         schemas.insert(
             "LabelSelectorRequirement".into(),
@@ -1924,6 +1925,115 @@ impl ProtoRegistry {
         ProtoRegistry { schemas }
     }
 
+    /// Schemas for the authorization.k8s.io/v1 review kinds.
+    fn insert_authorization_schemas(schemas: &mut HashMap<String, MessageSchema>) {
+        fn msg(name: &str) -> FieldType {
+            FieldType::Message(name.into())
+        }
+        fn schema(fields: Vec<(u32, &str, FieldType)>) -> MessageSchema {
+            MessageSchema {
+                fields: fields
+                    .into_iter()
+                    .map(|(num, name, ty)| (num, (name.to_string(), ty)))
+                    .collect(),
+            }
+        }
+
+        for name in ["FieldSelectorAttributes", "LabelSelectorAttributes"] {
+            schemas.insert(
+                name.into(),
+                schema(vec![
+                    (1, "rawSelector", FieldType::String),
+                    (
+                        2,
+                        "requirements",
+                        FieldType::Repeated(Box::new(msg("LabelSelectorRequirement"))),
+                    ),
+                ]),
+            );
+        }
+        schemas.insert(
+            "ResourceAttributes".into(),
+            schema(vec![
+                (1, "namespace", FieldType::String),
+                (2, "verb", FieldType::String),
+                (3, "group", FieldType::String),
+                (4, "version", FieldType::String),
+                (5, "resource", FieldType::String),
+                (6, "subresource", FieldType::String),
+                (7, "name", FieldType::String),
+                (8, "fieldSelector", msg("FieldSelectorAttributes")),
+                (9, "labelSelector", msg("LabelSelectorAttributes")),
+            ]),
+        );
+        schemas.insert(
+            "NonResourceAttributes".into(),
+            schema(vec![
+                (1, "path", FieldType::String),
+                (2, "verb", FieldType::String),
+            ]),
+        );
+        schemas.insert(
+            "SubjectAccessReviewStatus".into(),
+            schema(vec![
+                (1, "allowed", FieldType::Bool),
+                (2, "reason", FieldType::String),
+                (3, "evaluationError", FieldType::String),
+                (4, "denied", FieldType::Bool),
+            ]),
+        );
+        schemas.insert(
+            "SelfSubjectAccessReviewSpec".into(),
+            schema(vec![
+                (1, "resourceAttributes", msg("ResourceAttributes")),
+                (2, "nonResourceAttributes", msg("NonResourceAttributes")),
+            ]),
+        );
+        schemas.insert(
+            "SubjectAccessReviewSpec".into(),
+            schema(vec![
+                (1, "resourceAttributes", msg("ResourceAttributes")),
+                (2, "nonResourceAttributes", msg("NonResourceAttributes")),
+                (3, "user", FieldType::String),
+                (
+                    4,
+                    "groups",
+                    FieldType::Repeated(Box::new(FieldType::String)),
+                ),
+                (6, "uid", FieldType::String),
+            ]),
+        );
+        schemas.insert(
+            "SelfSubjectRulesReviewSpec".into(),
+            schema(vec![(1, "namespace", FieldType::String)]),
+        );
+        schemas.insert(
+            "SelfSubjectAccessReview".into(),
+            schema(vec![
+                (1, "metadata", msg("ObjectMeta")),
+                (2, "spec", msg("SelfSubjectAccessReviewSpec")),
+                (3, "status", msg("SubjectAccessReviewStatus")),
+            ]),
+        );
+        for kind in ["SubjectAccessReview", "LocalSubjectAccessReview"] {
+            schemas.insert(
+                kind.into(),
+                schema(vec![
+                    (1, "metadata", msg("ObjectMeta")),
+                    (2, "spec", msg("SubjectAccessReviewSpec")),
+                    (3, "status", msg("SubjectAccessReviewStatus")),
+                ]),
+            );
+        }
+        schemas.insert(
+            "SelfSubjectRulesReview".into(),
+            schema(vec![
+                (1, "metadata", msg("ObjectMeta")),
+                (2, "spec", msg("SelfSubjectRulesReviewSpec")),
+            ]),
+        );
+    }
+
     fn object_meta_schema() -> MessageSchema {
         MessageSchema {
             fields: HashMap::from([
@@ -3249,6 +3359,78 @@ mod tests {
         assert_eq!(
             val.pointer("/matchLabels/app"),
             Some(&Value::String("nginx".into()))
+        );
+    }
+
+    #[test]
+    fn test_decode_self_subject_access_review() {
+        let registry = ProtoRegistry::new();
+        // Body kubectl sends for `kubectl auth can-i list pods`.
+        let raw: Vec<u8> = [
+            &[0x0a, 0x10, 0x0a, 0x00, 0x12, 0x00, 0x1a, 0x00, 0x22, 0x00][..],
+            &[0x2a, 0x00, 0x32, 0x00, 0x38, 0x00, 0x42, 0x00][..],
+            &[0x12, 0x1f, 0x0a, 0x1d, 0x0a, 0x07][..],
+            b"default",
+            &[0x12, 0x04][..],
+            b"list",
+            &[0x1a, 0x00, 0x22, 0x00, 0x2a, 0x04][..],
+            b"pods",
+            &[0x32, 0x00, 0x3a, 0x00][..],
+            &[0x1a, 0x08, 0x08, 0x00, 0x12, 0x00, 0x1a, 0x00, 0x20, 0x00][..],
+        ]
+        .concat();
+        let api_version = b"authorization.k8s.io/v1";
+        let kind = b"SelfSubjectAccessReview";
+        let mut envelope = vec![0x0a, (2 + api_version.len() + 2 + kind.len()) as u8];
+        envelope.extend_from_slice(&[0x0a, api_version.len() as u8]);
+        envelope.extend_from_slice(api_version);
+        envelope.extend_from_slice(&[0x12, kind.len() as u8]);
+        envelope.extend_from_slice(kind);
+        envelope.extend_from_slice(&[0x12, raw.len() as u8]);
+        envelope.extend_from_slice(&raw);
+        let mut body = b"k8s\0".to_vec();
+        body.extend_from_slice(&envelope);
+
+        let json = registry.decode_k8s_resource(&body).unwrap();
+        let val: Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(val["kind"], "SelfSubjectAccessReview");
+        assert_eq!(
+            val.pointer("/spec/resourceAttributes/verb").unwrap(),
+            "list"
+        );
+        assert_eq!(
+            val.pointer("/spec/resourceAttributes/resource").unwrap(),
+            "pods"
+        );
+        assert_eq!(
+            val.pointer("/spec/resourceAttributes/namespace").unwrap(),
+            "default"
+        );
+    }
+
+    #[test]
+    fn test_decode_subject_access_review_groups() {
+        let registry = ProtoRegistry::new();
+        // spec (field 2): user (field 3) "bob", groups (field 4) "dev" and "ops".
+        let spec = [
+            &[0x1a, 0x03][..],
+            b"bob",
+            &[0x22, 0x03][..],
+            b"dev",
+            &[0x22, 0x03][..],
+            b"ops",
+        ]
+        .concat();
+        let mut review = vec![0x12, spec.len() as u8];
+        review.extend_from_slice(&spec);
+
+        let val = registry
+            .decode_message("SubjectAccessReview", &review)
+            .unwrap();
+        assert_eq!(val.pointer("/spec/user").unwrap(), "bob");
+        assert_eq!(
+            val.pointer("/spec/groups").unwrap(),
+            &serde_json::json!(["dev", "ops"])
         );
     }
 

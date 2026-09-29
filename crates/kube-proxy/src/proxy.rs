@@ -197,6 +197,7 @@ impl KubeProxy {
             services.len(),
             endpointslice_map.len()
         );
+        self.iptables.refresh_bridge_cidr();
         let nat_rules = self
             .iptables
             .build_nat_rules(&services, &endpointslice_map)

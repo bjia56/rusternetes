@@ -3409,6 +3409,59 @@ impl Kubelet {
                 }
             }
             Phase::Running if !is_running => {
+                // A pod with init containers has no regular container running until they
+                // finish. While one still runs, keep waiting; once all completed but the
+                // regular containers do not exist yet, create them.
+                let init_containers = pod
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.init_containers.as_ref())
+                    .map(|ics| {
+                        ics.iter()
+                            .filter(|c| c.restart_policy.as_deref() != Some("Always"))
+                            .map(|c| format!("{}_{}", pod_name, c.name))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if !init_containers.is_empty() {
+                    let mut init_running = false;
+                    for name in &init_containers {
+                        init_running |= self
+                            .runtime
+                            .is_container_running(name)
+                            .await
+                            .unwrap_or(false);
+                    }
+                    if init_running {
+                        debug!(
+                            "Pod {}/{} still running init containers",
+                            namespace, pod_name
+                        );
+                        return Ok(());
+                    }
+                    let regular_missing = match pod.spec.as_ref() {
+                        Some(spec) => {
+                            let mut missing = false;
+                            for c in &spec.containers {
+                                let name = format!("{}_{}", pod_name, c.name);
+                                missing |= !self.runtime.container_exists(&name).await;
+                            }
+                            missing
+                        }
+                        None => false,
+                    };
+                    if regular_missing && self.runtime.compute_init_container_actions(pod).await.0 {
+                        info!(
+                            "All init containers completed for pod {}/{}, starting app containers",
+                            namespace, pod_name
+                        );
+                        if let Err(e) = self.runtime.start_pod(pod).await {
+                            error!("Failed to start containers after init: {}", e);
+                        }
+                        return Ok(());
+                    }
+                }
+
                 // Containers have stopped — decide based on restart policy
                 let restart_policy = pod
                     .spec

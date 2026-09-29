@@ -181,15 +181,15 @@ impl<S: Storage + 'static> TTLController<S> {
         Ok(())
     }
 
-    /// Get TTL seconds from Job spec
+    /// Get TTL seconds from the Job spec, falling back to the annotation
     pub fn get_ttl_seconds_after_finished(&self, job: &Job) -> Option<i32> {
-        // Check if the job spec has ttlSecondsAfterFinished annotation
-        // Since we don't have it in the spec yet, check annotations
-        job.metadata
-            .annotations
-            .as_ref()
-            .and_then(|a| a.get("ttlSecondsAfterFinished"))
-            .and_then(|v| v.parse().ok())
+        job.spec.ttl_seconds_after_finished.or_else(|| {
+            job.metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get("ttlSecondsAfterFinished"))
+                .and_then(|v| v.parse().ok())
+        })
     }
 
     /// Check if a Job should be cleaned up
@@ -496,5 +496,55 @@ mod tests {
         // Should NOT be cleaned up since it just finished and TTL is 1 hour
         let should_cleanup = controller.should_cleanup(&job, 3600, now).await;
         assert!(!should_cleanup);
+    }
+
+    #[tokio::test]
+    async fn test_ttl_seconds_read_from_spec() {
+        let storage = Arc::new(rusternetes_storage::memory::MemoryStorage::new());
+        let controller =
+            TTLController::<rusternetes_storage::memory::MemoryStorage>::new(storage.clone());
+
+        let mut job = create_test_job("test-job", "default", 100);
+        job.metadata.annotations = None;
+        job.spec.ttl_seconds_after_finished = Some(300);
+        assert_eq!(controller.get_ttl_seconds_after_finished(&job), Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_ttl_spec_takes_precedence_over_annotation() {
+        let storage = Arc::new(rusternetes_storage::memory::MemoryStorage::new());
+        let controller =
+            TTLController::<rusternetes_storage::memory::MemoryStorage>::new(storage.clone());
+
+        let mut job = create_test_job("test-job", "default", 100);
+        job.spec.ttl_seconds_after_finished = Some(300);
+        assert_eq!(controller.get_ttl_seconds_after_finished(&job), Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_ttl_absent_returns_none() {
+        let storage = Arc::new(rusternetes_storage::memory::MemoryStorage::new());
+        let controller =
+            TTLController::<rusternetes_storage::memory::MemoryStorage>::new(storage.clone());
+
+        let mut job = create_test_job("test-job", "default", 100);
+        job.metadata.annotations = None;
+        assert_eq!(controller.get_ttl_seconds_after_finished(&job), None);
+    }
+
+    #[tokio::test]
+    async fn test_check_job_ttl_deletes_expired_job_with_spec_ttl() {
+        let storage = Arc::new(rusternetes_storage::memory::MemoryStorage::new());
+        let controller =
+            TTLController::<rusternetes_storage::memory::MemoryStorage>::new(storage.clone());
+
+        let mut job = create_test_job("test-job", "default", 100);
+        job.metadata.annotations = None;
+        job.spec.ttl_seconds_after_finished = Some(60);
+        let key = build_key("jobs", Some("default"), "test-job");
+        storage.create(&key, &job).await.unwrap();
+
+        controller.check_job_ttl(&job).await.unwrap();
+        assert!(storage.get::<Job>(&key).await.is_err());
     }
 }

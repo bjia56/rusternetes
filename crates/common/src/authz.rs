@@ -100,6 +100,17 @@ impl RequestAttributes {
         self.subresource = Some(subresource.into());
         self
     }
+
+    /// The resource as named in RBAC rules: `resource/subresource` when a
+    /// subresource is being accessed, otherwise the plain resource.
+    pub fn rbac_resource(&self) -> String {
+        match &self.subresource {
+            Some(subresource) if !self.resource.contains('/') => {
+                format!("{}/{}", self.resource, subresource)
+            }
+            _ => self.resource.clone(),
+        }
+    }
 }
 
 /// Authorization decision
@@ -262,7 +273,8 @@ impl<S: AuthzStorage> RBACAuthorizer<S> {
 
         // Check resource
         if let Some(ref resources) = rule.resources {
-            if !resources.contains(&attrs.resource) && !resources.contains(&"*".to_string()) {
+            let requested = attrs.rbac_resource();
+            if !resources.contains(&requested) && !resources.contains(&"*".to_string()) {
                 return false;
             }
         }
@@ -821,5 +833,90 @@ mod tests {
         // This would need a mock storage implementation to fully test
         // Just testing the rule matching logic
         assert!(rule.verbs.contains(&attrs.verb));
+    }
+
+    struct NoStorage;
+
+    #[async_trait]
+    impl AuthzStorage for NoStorage {
+        async fn get<T>(&self, key: &str, _namespace: Option<&str>) -> Result<T>
+        where
+            T: DeserializeOwned + Send + Sync,
+        {
+            Err(crate::Error::NotFound(key.to_string()))
+        }
+
+        async fn list<T>(&self, _namespace: Option<&str>) -> Result<Vec<T>>
+        where
+            T: serde::Serialize + DeserializeOwned + Send + Sync,
+        {
+            Ok(Vec::new())
+        }
+    }
+
+    fn test_user() -> UserInfo {
+        UserInfo {
+            username: "system:serviceaccount:ns:sa".to_string(),
+            uid: "uid".to_string(),
+            groups: vec![],
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    fn rule_for(resources: &[&str], verbs: &[&str]) -> PolicyRule {
+        PolicyRule {
+            verbs: verbs.iter().map(|v| v.to_string()).collect(),
+            api_groups: Some(vec!["example.com".to_string()]),
+            resources: Some(resources.iter().map(|r| r.to_string()).collect()),
+            resource_names: None,
+            non_resource_urls: None,
+        }
+    }
+
+    fn status_patch() -> RequestAttributes {
+        RequestAttributes::new(test_user(), "patch", "widgets")
+            .with_namespace("ns")
+            .with_api_group("example.com")
+            .with_subresource("status")
+    }
+
+    #[test]
+    fn test_rbac_resource_includes_subresource() {
+        assert_eq!(status_patch().rbac_resource(), "widgets/status");
+        let plain = RequestAttributes::new(test_user(), "get", "widgets");
+        assert_eq!(plain.rbac_resource(), "widgets");
+        let embedded = RequestAttributes::new(test_user(), "get", "widgets/status");
+        assert_eq!(embedded.rbac_resource(), "widgets/status");
+    }
+
+    #[test]
+    fn test_subresource_rule_allows_subresource_request() {
+        let authorizer = RBACAuthorizer::new(Arc::new(NoStorage));
+        let rule = rule_for(&["widgets/status"], &["patch"]);
+        assert!(authorizer.rule_allows(&rule, &status_patch()));
+    }
+
+    #[test]
+    fn test_plain_resource_rule_denies_subresource_request() {
+        let authorizer = RBACAuthorizer::new(Arc::new(NoStorage));
+        let rule = rule_for(&["widgets"], &["patch"]);
+        assert!(!authorizer.rule_allows(&rule, &status_patch()));
+    }
+
+    #[test]
+    fn test_subresource_rule_denies_plain_request() {
+        let authorizer = RBACAuthorizer::new(Arc::new(NoStorage));
+        let rule = rule_for(&["widgets/status"], &["patch"]);
+        let attrs = RequestAttributes::new(test_user(), "patch", "widgets")
+            .with_namespace("ns")
+            .with_api_group("example.com");
+        assert!(!authorizer.rule_allows(&rule, &attrs));
+    }
+
+    #[test]
+    fn test_wildcard_rule_allows_subresource_request() {
+        let authorizer = RBACAuthorizer::new(Arc::new(NoStorage));
+        let rule = rule_for(&["*"], &["patch"]);
+        assert!(authorizer.rule_allows(&rule, &status_patch()));
     }
 }

@@ -3111,94 +3111,8 @@ impl ContainerRuntime {
                         if let Some(parent) = std::path::Path::new(&token_path).parent() {
                             std::fs::create_dir_all(parent)?;
                         }
-                        // Generate a real JWT token bound to this pod
-                        let sa_name = pod
-                            .spec
-                            .as_ref()
-                            .and_then(|s| s.service_account_name.as_deref())
-                            .unwrap_or("default");
-                        let sa_uid = if let Some(storage) = storage {
-                            let sa_key = build_key("serviceaccounts", Some(namespace), sa_name);
-                            match storage
-                                .get::<rusternetes_common::resources::ServiceAccount>(&sa_key)
-                                .await
-                            {
-                                Ok(sa) => sa.metadata.uid.clone(),
-                                Err(_) => String::new(),
-                            }
-                        } else {
-                            String::new()
-                        };
-                        let expiration_seconds = sa_token.expiration_seconds.unwrap_or(3600);
-                        let now = chrono::Utc::now();
-                        let exp = now.timestamp() + expiration_seconds;
-                        let mut audiences = vec!["rusternetes".to_string()];
-                        if let Some(ref aud) = sa_token.audience {
-                            audiences = vec![aud.clone()];
-                        }
-                        let node_name = pod.spec.as_ref().and_then(|s| s.node_name.clone());
-                        let node_uid = if let (Some(ref nn), Some(st)) = (&node_name, storage) {
-                            let node_key = build_key("nodes", None::<&str>, nn);
-                            st.get::<serde_json::Value>(&node_key)
-                                .await
-                                .ok()
-                                .and_then(|v| {
-                                    v.pointer("/metadata/uid")
-                                        .and_then(|u| u.as_str())
-                                        .map(|s| s.to_string())
-                                })
-                        } else {
-                            None
-                        };
-                        let claims = rusternetes_common::auth::ServiceAccountClaims {
-                            sub: format!("system:serviceaccount:{}:{}", namespace, sa_name),
-                            namespace: namespace.to_string(),
-                            uid: sa_uid.clone(),
-                            iat: now.timestamp(),
-                            exp,
-                            iss: "https://kubernetes.default.svc.cluster.local".to_string(),
-                            aud: audiences,
-                            kubernetes: Some(rusternetes_common::auth::KubernetesClaims {
-                                namespace: namespace.to_string(),
-                                svcacct: rusternetes_common::auth::KubeRef {
-                                    name: sa_name.to_string(),
-                                    uid: sa_uid,
-                                },
-                                pod: Some(rusternetes_common::auth::KubeRef {
-                                    name: pod_name.clone(),
-                                    uid: pod.metadata.uid.clone(),
-                                }),
-                                node: node_name.as_ref().map(|nn| {
-                                    rusternetes_common::auth::KubeRef {
-                                        name: nn.clone(),
-                                        uid: node_uid.clone().unwrap_or_default(),
-                                    }
-                                }),
-                            }),
-                            pod_name: Some(pod_name.clone()),
-                            pod_uid: Some(pod.metadata.uid.clone()),
-                            node_name,
-                            node_uid,
-                        };
-                        let token = match self.token_manager.generate_token(claims) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                warn!(
-                                    "Failed to generate SA token for pod {}: {}, using placeholder",
-                                    pod_name, e
-                                );
-                                "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.placeholder".to_string()
-                            }
-                        };
-                        std::fs::write(&token_path, &token)?;
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            std::fs::set_permissions(
-                                &token_path,
-                                std::fs::Permissions::from_mode(proj_default_mode as u32),
-                            )?;
-                        }
+                        self.write_sa_token(pod, sa_token, &token_path, proj_default_mode)
+                            .await?;
                     }
                 }
             }
@@ -7369,6 +7283,151 @@ impl ContainerRuntime {
         Ok(())
     }
 
+    /// Mint a pod-bound service account JWT and write it to `token_path`.
+    async fn write_sa_token(
+        &self,
+        pod: &Pod,
+        sa_token: &rusternetes_common::resources::ServiceAccountTokenProjection,
+        token_path: &str,
+        file_mode: i32,
+    ) -> Result<()> {
+        let pod_name = &pod.metadata.name;
+        let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
+        // Generate a real JWT token bound to this pod
+        let sa_name = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.service_account_name.as_deref())
+            .unwrap_or("default");
+        let sa_uid = if let Some(storage) = self.storage.as_ref() {
+            let sa_key = build_key("serviceaccounts", Some(namespace), sa_name);
+            match storage
+                .get::<rusternetes_common::resources::ServiceAccount>(&sa_key)
+                .await
+            {
+                Ok(sa) => sa.metadata.uid.clone(),
+                Err(_) => String::new(),
+            }
+        } else {
+            String::new()
+        };
+        let expiration_seconds = sa_token.expiration_seconds.unwrap_or(3600);
+        let now = chrono::Utc::now();
+        let exp = now.timestamp() + expiration_seconds;
+        let mut audiences = vec!["rusternetes".to_string()];
+        if let Some(ref aud) = sa_token.audience {
+            audiences = vec![aud.clone()];
+        }
+        let node_name = pod.spec.as_ref().and_then(|s| s.node_name.clone());
+        let node_uid = if let (Some(ref nn), Some(st)) = (&node_name, self.storage.as_ref()) {
+            let node_key = build_key("nodes", None::<&str>, nn);
+            st.get::<serde_json::Value>(&node_key)
+                .await
+                .ok()
+                .and_then(|v| {
+                    v.pointer("/metadata/uid")
+                        .and_then(|u| u.as_str())
+                        .map(|s| s.to_string())
+                })
+        } else {
+            None
+        };
+        let claims = rusternetes_common::auth::ServiceAccountClaims {
+            sub: format!("system:serviceaccount:{}:{}", namespace, sa_name),
+            namespace: namespace.to_string(),
+            uid: sa_uid.clone(),
+            iat: now.timestamp(),
+            exp,
+            iss: "https://kubernetes.default.svc.cluster.local".to_string(),
+            aud: audiences,
+            kubernetes: Some(rusternetes_common::auth::KubernetesClaims {
+                namespace: namespace.to_string(),
+                svcacct: rusternetes_common::auth::KubeRef {
+                    name: sa_name.to_string(),
+                    uid: sa_uid,
+                },
+                pod: Some(rusternetes_common::auth::KubeRef {
+                    name: pod_name.clone(),
+                    uid: pod.metadata.uid.clone(),
+                }),
+                node: node_name
+                    .as_ref()
+                    .map(|nn| rusternetes_common::auth::KubeRef {
+                        name: nn.clone(),
+                        uid: node_uid.clone().unwrap_or_default(),
+                    }),
+            }),
+            pod_name: Some(pod_name.clone()),
+            pod_uid: Some(pod.metadata.uid.clone()),
+            node_name,
+            node_uid,
+        };
+        let token = match self.token_manager.generate_token(claims) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(
+                    "Failed to generate SA token for pod {}: {}, using placeholder",
+                    pod_name, e
+                );
+                "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.placeholder".to_string()
+            }
+        };
+        std::fs::write(token_path, &token)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                token_path,
+                std::fs::Permissions::from_mode(file_mode as u32),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Re-mint projected service account tokens once 80% of their lifetime has passed.
+    async fn rotate_projected_sa_tokens(
+        &self,
+        pod: &Pod,
+        volume: &rusternetes_common::resources::Volume,
+    ) -> Result<()> {
+        let Some(sources) = volume.projected.as_ref().and_then(|p| p.sources.as_ref()) else {
+            return Ok(());
+        };
+        let default_mode = volume
+            .projected
+            .as_ref()
+            .and_then(|p| p.default_mode)
+            .unwrap_or(0o644);
+        let volume_dir = format!(
+            "{}/{}/{}",
+            self.volumes_base_path, pod.metadata.name, volume.name
+        );
+        for sa_token in sources
+            .iter()
+            .filter_map(|s| s.service_account_token.as_ref())
+        {
+            let token_path = format!("{}/{}", volume_dir, sa_token.path);
+            let Ok(age) = std::fs::metadata(&token_path)
+                .and_then(|m| m.modified())
+                .map(|t| t.elapsed().unwrap_or_default())
+            else {
+                continue;
+            };
+            let lifetime = sa_token.expiration_seconds.unwrap_or(3600).max(600) as u64;
+            if age < Duration::from_secs(lifetime * 4 / 5) {
+                continue;
+            }
+            self.write_sa_token(pod, sa_token, &token_path, default_mode)
+                .await?;
+            debug!(
+                "Rotated service account token for pod {}/{}",
+                pod.metadata.namespace.as_deref().unwrap_or("default"),
+                pod.metadata.name
+            );
+        }
+        Ok(())
+    }
+
     /// Refresh Secret and ConfigMap volumes for a running pod.
     /// Re-reads the data from storage and overwrites files on disk.
     pub async fn refresh_volumes(&self, pod: &Pod) -> Result<()> {
@@ -7388,6 +7447,7 @@ impl ContainerRuntime {
         };
 
         for volume in volumes {
+            self.rotate_projected_sa_tokens(pod, volume).await?;
             let volume_dir = format!("{}/{}/{}", self.volumes_base_path, pod_name, volume.name);
 
             // Refresh Secret volumes
